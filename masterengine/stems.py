@@ -1,9 +1,9 @@
-"""Stem separation (lightweight HPSS/band model + optional Demucs) and per-stem mastering.
+"""Stem separation (chunked HPSS + optional Demucs) and per-stem mastering.
 
-Default engine: STFT harmonic/percussive source separation (Fitzgerald median
-masking) + formant/band masking for vocal, bass, drums and other components.
-If `demucs` is installed (`pip install demucs torch torchaudio`), it is used
-instead for production-grade 4-stem separation.
+Default engine: frame-grid STFT harmonic/percussive separation (Fitzgerald
+median masking) processed in time-chunks with crossfaded overlap-add so memory
+stays bounded for arbitrarily long tracks. If `demucs` is installed
+(`pip install demucs torch torchaudio`), it is used automatically instead.
 """
 from __future__ import annotations
 
@@ -15,51 +15,95 @@ from . import analysis, master
 
 N_FFT = 4096
 HOP = 1024
+CHUNK = 262144
+OVERLAP = 32768
 
 STEM_ORDER = ["drums", "bass", "vocals", "other"]
-
-
-def _stft(x):
-    freqs, t, Z = signal.stft(x.T, axis=1, nperseg=N_FFT, noverlap=N_FFT - HOP,
-                              window="hann", padded=True)
-    return freqs, t, Z  # Z: (ch, freq, time) complex
-
-
-def _istft(Z, t_len):
-    _, y = signal.istft(Z, nperseg=N_FFT, noverlap=N_FFT - HOP, window="hann", time_axis=-1, freq_axis=-2)
-    return y.T[:t_len]
-
-
-def _median_masks(Z, margin=(1.0, 2.0)):
-    mag = np.abs(Z).mean(axis=0)
-    harm = median_filter(mag, size=(1, 17))
-    perc = median_filter(mag, size=(17, 1))
-    h_mask = np.clip(harm ** 2 / (harm ** 2 + perc ** 2 + 1e-12), 0, 1)[None]
-    p_mask = np.clip(perc ** 2 / (harm ** 2 + perc ** 2 + 1e-12), 0, 1)[None]
-    return h_mask, p_mask
-
-
-def _soft_band_mask(freqs, lo, hi, soft=0.35):
-    f = freqs.reshape(1, -1, 1)
-    m = 1.0 / (1.0 + np.exp(np.clip((lo - f) / (lo * soft + 1), -60, 60)))
-    m *= 1.0 / (1.0 + np.exp(np.clip((f - hi) / (hi * soft + 1), -60, 60)))
-    return m
 
 
 def demucs_stems(audio, sr, model_name="htdemucs"):
     import torch
     audio_t = torch.as_tensor(audio.T).float()
     if audio.shape[1] == 1:
-        audio_t = audio_t.repeat(1, 2, 1) if audio_t.dim() == 3 else audio_t
+        audio_t = audio_t.repeat(1, 2, 1)
     audio_t = audio_t.unsqueeze(0)
     model = __import__("demucs.pretrained", fromlist=["get_model"]).get_model(model_name)
     wav = model(waveforms=audio_t, sample_rate=int(sr))
     out = wav[0].numpy().T
     names = list(model.sources)
-    return {n: out[:, :, i].copy() if out.ndim == 3 else out[:, i, :].T for i, n in enumerate(names)}
+    return {name: out[:, :, i].copy() if out.ndim == 3 else out[:, i, :].T for i, name in enumerate(names)}
 
 
-def separate(x, sr, engine="auto") -> dict:
+def _soft_band_mask_f(freqs, lo, hi, soft=0.35):
+    lo = max(lo, 1.0)
+    m = 1.0 / (1.0 + np.exp(np.clip((lo - freqs) / (lo * soft + 1.0), -60, 60)))
+    m *= 1.0 / (1.0 + np.exp(np.clip((freqs - hi) / (hi * soft + 1.0), -60, 60)))
+    return m
+
+
+def _chunk_loop(x, sr, chunk_cb, progress_cb=None):
+    """Run chunk_cb(seg, freqs, Z) per time-chunk with crossfaded overlap-add."""
+    n = x.shape[0]
+    ramp = OVERLAP // 2
+    t_i = np.linspace(0, np.pi, max(ramp, 1))
+    win = np.sqrt(0.5 - 0.5 * np.cos(t_i))
+    weights = np.zeros(n)
+    outs = {}
+    pos = 0
+    step = 0
+    n_steps = max(1, math_ceil(n / CHUNK))
+    while pos < n:
+        end = min(pos + CHUNK, n)
+        lo = max(0, pos - OVERLAP)
+        hi = min(n, end + OVERLAP)
+        seg_len = hi - lo
+        env = np.ones(seg_len)
+        if lo > 0:
+            env[:ramp] *= win
+        if hi < n:
+            env[-ramp:] *= win
+        seg = x[lo:hi].astype(np.float64)
+        freqs, _, Z = signal.stft(seg.T, axis=1, nperseg=N_FFT, noverlap=N_FFT - HOP,
+                                  window="hann", padded=True)
+        stem_frames = chunk_cb(freqs, Z, seg_len)
+        for name, frames in stem_frames.items():
+            buf = outs.setdefault(name, np.zeros((n, x.shape[1]), dtype=np.float32))
+            _, y = signal.istft(frames, nperseg=N_FFT, noverlap=N_FFT - HOP,
+                                window="hann", time_axis=-1, freq_axis=-2)
+            y = y.T[:seg_len]
+            buf[lo:hi] = (buf[lo:hi].astype(np.float64) + y * env[:, None]).astype(np.float32)
+        weights[lo:hi] += env
+        pos = end
+        step += 1
+        if progress_cb:
+            progress_cb(step, n_steps)
+    for name, buf in outs.items():
+        buf /= np.maximum(weights, 1e-6)[:, None]
+    for name in STEM_ORDER:
+        outs.setdefault(name, np.zeros((n, x.shape[1]), dtype=np.float32))
+    return outs
+
+
+def math_ceil(x):
+    import math
+    return math.ceil(x)
+
+
+def hpss_masks(freqs, Z):
+    mag = np.abs(Z).mean(axis=0)
+    harm = median_filter(mag, size=(1, 17))
+    perc = median_filter(mag, size=(17, 1))
+    h = harm ** 2 / (harm ** 2 + perc ** 2 + 1e-12)
+    mids = _soft_band_mask_f(freqs, 220.0, 8000.0)[:, None]
+    lows = _soft_band_mask_f(freqs, 20.0, 190.0)[:, None]
+    drums = (1 - h)[None]
+    vocals = (h * mids)[None]
+    bass = (h * lows * np.clip(1 - mids, 0, 1))[None]
+    other = np.clip(1.0 - drums - vocals - bass, 0, 1)
+    return {"drums": drums, "vocals": vocals, "bass": bass, "other": other}
+
+
+def separate(x, sr, engine="auto", progress_cb=None) -> dict:
     if x.ndim == 1:
         x = np.stack([x, x], axis=1)
     if engine in ("auto", "demucs"):
@@ -72,25 +116,11 @@ def separate(x, sr, engine="auto") -> dict:
             if engine == "demucs":
                 raise
 
-    freqs, t, Z = _stft(x)
-    h_mask, p_mask = _median_masks(Z)
-    drums_m = p_mask
-    harm = Z * h_mask
-    f = freqs.reshape(1, -1, 1)
-    mids = _soft_band_mask(freqs, 220.0, 8000.0)
-    lows = 1.0 - _soft_band_mask(freqs, 0.0, 160.0)
-    lows = _soft_band_mask(freqs, 20.0, 190.0)
-    voc_mask = mids
-    bass_mask = lows
-    other_mask = np.clip(1.0 - mids - 0.8 * lows, 0, 1)
+    def cb(freqs, Z, _seg_len):
+        return {name: Z * mask for name, mask in hpss_masks(freqs, Z).items()}
 
-    stems = {
-        "drums": _istft(Z * drums_m, x.shape[0]),
-        "vocals": _istft(harm * voc_mask, x.shape[0]),
-        "bass": _istft(harm * bass_mask * np.clip(1 - voc_mask, 0, 1), x.shape[0]),
-        "other": _istft(harm * other_mask, x.shape[0]),
-    }
-    return stems
+    outs = _chunk_loop(x, sr, cb, progress_cb)
+    return {k: v.astype(np.float64) for k, v in outs.items()}
 
 
 STEM_REFERENCE = {
@@ -140,8 +170,8 @@ def build_stem_params(name, feats, width=1.0):
     return p
 
 
-def master_stems(x, sr, refine_iters=2) -> dict:
-    stems = separate(x, sr)
+def master_stems(x, sr, refine_iters=2, progress_cb=None) -> dict:
+    stems = separate(x, sr, progress_cb=progress_cb)
     out = {}
     feats_in = {}
     feats_out = {}
