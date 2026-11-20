@@ -1,6 +1,9 @@
 /* MasterEngine web panel — Pyodide bridge to the Python engine. */
 const $ = s => document.querySelector(s);
-const status = (s, err) => { const el = $("#status"); el.textContent = s; el.className = err ? "err" : ""; };
+const status = (s, err, done) => {
+  const el = $("#status"); el.textContent = s; el.className = err ? "err" : "";
+  const sp = $("#spin"); sp.className = done ? "spin done" : "spin"; sp.textContent = done ? "✓" : "";
+};
 
 let PY = null, engineReady = false;
 let audioLoaded = false, sr = 0, nSamples = 0, lastRes = null;
@@ -75,18 +78,18 @@ async function boot() {
     await pyodide.loadPackage(["numpy", "scipy"]);
     status("Гружу движок MasterEngine…");
     const files = ["__init__.py", "dsp.py", "analysis.py", "ml.py", "master.py", "stems.py"];
-    pyodide.FS.mkdirTree("/engine");
+    pyodide.FS.mkdirTree("/engine/masterengine");
     for (const f of files) {
       const r = await fetch("masterengine/" + f);
       if (!r.ok) throw new Error("fetch " + f + ": " + r.status);
-      pyodide.FS.writeFile("/engine/" + f, new Uint8Array(await r.arrayBuffer()));
+      pyodide.FS.writeFile("/engine/masterengine/" + f, new Uint8Array(await r.arrayBuffer()));
     }
     await pyodide.runPythonAsync(GLUE);
     PY = pyodide;
     engineReady = true;
     $("#stemsOn").disabled = false;
     $("#drop").classList.add("ready");
-    status("Движок готов. Бросай трек.");
+    status("Движок готов — бросай трек, обработаю за десяток секунд", false, true);
   } catch (e) {
     status("Не удалось запустить движок: " + e.message, true);
   }
@@ -102,6 +105,7 @@ $("#file").onchange = e => { if (e.target.files[0]) load(e.target.files[0]); };
 
 async function load(file) {
   try {
+    $("#drop").classList.add("lock");
     status("Декодирую " + file.name + "…");
     const buf = await file.arrayBuffer();
     const ctx = new (window.AudioContext || window.webkitAudioContext)();
@@ -116,11 +120,13 @@ async function load(file) {
     PY.globals.set("me_in", new Uint8Array(interleaved.buffer));
     await PY.runPythonAsync(`set_audio(me_in.to_bytes(), ${nSamples}, ${sr})`);
     audioLoaded = true;
-    status("Трек " + Math.round(ab.duration) + "s · " + sr + " Hz. Мастерю (не закрывай вкладку)…");
+    status("Трек " + Math.round(ab.duration) + "s · " + (sr / 1000) + " kHz · мастерю, ~15–60 сек, не закрывай вкладку…");
     await new Promise(r => setTimeout(r, 30));
     await process({ stems: $("#stemsOn").checked });
   } catch (e) {
-    status("Ошибка: " + e.message, true);
+    status("Ошибка: " + String(e.message || e).split("\n").slice(-4).join(" | "), true);
+  } finally {
+    $("#drop").classList.remove("lock");
   }
 }
 
@@ -128,10 +134,17 @@ async function process(opts) {
   if (!audioLoaded) return;
   $("#rerun").disabled = true;
   PY.globals.set("me_cfg", JSON.stringify(opts));
-  const out = PY.runPython("run_master(me_cfg)");
+  let out;
+  try {
+    out = PY.runPython("run_master(me_cfg)");
+  } catch (e) {
+    status("Ошибка обработки: " + String(e.message || e).split("\n").slice(-4).join(" | "), true);
+    $("#rerun").disabled = false;
+    return;
+  }
   lastRes = JSON.parse(out);
   $("#rerun").disabled = false;
-  status("Готово ✅ Жми A ⇄ B и слушай в наушниках. loss = " + lastRes.loss.toFixed(2));
+  status("Готово! Жми A ⇄ B и слушай разницу в наушниках. loss = " + lastRes.loss.toFixed(2), false, true);
   show();
 }
 
