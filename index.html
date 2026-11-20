@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MasterEngine — AI Mastering (Web)</title>
+<style>
+:root{--bg:#0b0e14;--card:#121722;--line:#1e2636;--txt:#dbe4f3;--dim:#7a879e;--acc:#6c9bff;--acc2:#31d0aa;--bad:#ff6b81}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--txt);font:14px/1.5 "Segoe UI",system-ui,sans-serif}
+.wrap{max-width:1080px;margin:0 auto;padding:24px}
+h1{font-size:22px;margin:0 0 4px}h1 span{color:var(--acc)}
+.sub{color:var(--dim);margin:0 0 20px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:18px;margin-bottom:16px}
+.row{display:flex;gap:16px;flex-wrap:wrap}.row>*{flex:1;min-width:280px}
+#drop{border:2px dashed #2a3853;color:var(--dim);border-radius:10px;padding:36px;text-align:center;cursor:pointer;transition:.2s}
+#drop.ready{border-color:var(--acc);color:var(--acc)}
+#drop.on{border-color:var(--acc2)}
+button{background:var(--acc);color:#08111f;border:0;border-radius:8px;padding:10px 18px;font-weight:600;cursor:pointer;font-size:14px}
+button.sec{background:#1c2740;color:var(--txt)}
+button:disabled{opacity:.45;cursor:default}
+table{width:100%;border-collapse:collapse}
+td,th{padding:6px 8px;text-align:left;border-bottom:1px solid var(--line)}
+th{color:var(--dim);font-weight:500}
+.good{color:var(--acc2)}.warn{color:var(--bad)}
+label.chk{display:flex;gap:8px;align-items:center;margin-top:10px;color:var(--dim);cursor:pointer}
+#players{display:flex;gap:10px;align-items:center;margin-top:12px;flex-wrap:wrap}
+.pl{flex:1;min-width:240px}.pl audio{width:100%}
+.pl h4{margin:0 0 6px;color:var(--dim);font-weight:500}
+.tag{font-size:11px;padding:2px 8px;border-radius:99px;background:#1c2740;color:var(--acc);margin-left:6px}
+canvas{width:100%;display:block;background:#0d1220;border-radius:8px}
+.stem{border:1px solid var(--line);border-radius:10px;padding:12px;margin-top:10px}
+.stem h3{margin:0 0 8px;font-size:15px;color:var(--acc2)}
+.meters{display:flex;gap:14px;flex-wrap:wrap;margin-top:8px}
+.meter .v{font-size:20px;font-weight:700}.meter .l{color:var(--dim);font-size:12px}
+#params label{display:flex;justify-content:space-between;align-items:center;gap:10px;margin:6px 0;color:var(--dim)}
+#params input[type=range]{flex:1}
+a.dl{color:var(--acc);text-decoration:none;margin:0 12px 6px 0;display:inline-block}
+#status{color:var(--dim);min-height:22px;margin-top:8px}
+#status.err{color:var(--bad)}
+#note{color:var(--dim);font-size:12px;margin-top:6px}
+</style>
+</head>
+<body>
+<div class="wrap">
+<h1>🎛 Master<span>Engine</span> <span class="tag">web · GitHub Pages</span></h1>
+<p class="sub">Полный авто-мастеринг работает прямо в твоём браузере (WASM numpy/scipy) — файлы никуда не загружаются. Первый запуск качает рантайм (~25&nbsp;МБ), дальше всё быстро.</p>
+
+<div class="card">
+  <div id="drop">Брось сюда трек (wav / mp3 / flac) или кликни для выбора<input type="file" id="file" hidden accept="audio/*,.wav,.mp3,.flac,.m4a,.ogg"></div>
+  <label class="chk"><input type="checkbox" id="stemsOn" disabled> Разбить на дорожки и смастерить каждую отдельно (медленнее — HPSS в браузере)</label>
+  <div id="status">Инициализация движка…</div>
+  <div id="note">Наушники советую 🎧 A ⇄ B — и сразу слышишь разницу.</div>
+</div>
+
+<div id="results" style="display:none">
+<div class="row">
+  <div class="card">
+    <h3 style="margin-top:0">Метрики</h3>
+    <table id="metrics"><tr><th></th><th>До</th><th>После</th></tr></table>
+    <div class="meters" id="meters"></div>
+  </div>
+  <div class="card">
+    <h3 style="margin-top:0">Настройки цепочки <span class="tag">live</span></h3>
+    <div id="params"></div>
+    <button class="sec" id="rerun">↻ Пересчитать с этими настройками</button>
+  </div>
+</div>
+
+<div class="card" id="players">
+  <div class="pl"><h4>Оригинал</h4><audio id="au0" controls preload="auto"></audio></div>
+  <div class="pl"><h4>Мастер</h4><audio id="au1" controls preload="auto"></audio></div>
+  <button class="sec" id="ab">A ⇄ B</button>
+</div>
+
+<div class="card">
+  <h3 style="margin-top:0">Волна</h3>
+  <div id="waves"></div>
+</div>
+
+<div class="card">
+  <h3 style="margin-top:0">Спектр · тёмный = оригинал, бирюзовый = мастер</h3>
+  <canvas id="spec" width="1000" height="220"></canvas>
+</div>
+
+<div class="card" id="stemsCard" style="display:none">
+  <h3 style="margin-top:0">Мастеринг по дорожкам</h3>
+  <div id="stemsList"></div>
+</div>
+
+<div class="card">
+  <h3 style="margin-top:0">Скачать WAV</h3>
+  <div id="dls"></div>
+</div>
+</div>
+</div>
+<script src="https://cdn.jsdelivr.net/pyodide/v0.26.4/full/pyodide.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
