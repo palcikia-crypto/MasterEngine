@@ -31,11 +31,11 @@ def _istft(Z, t_len):
 
 
 def _median_masks(Z, margin=(1.0, 2.0)):
-    mag = np.abs(Z)
-    harm = median_filter(mag, size=(1, 1, 17))
-    perc = median_filter(mag, size=(1, 17, 1))
-    h_mask = np.clip(harm ** 2 / (harm ** 2 + perc ** 2 + 1e-12), 0, 1)
-    p_mask = np.clip(perc ** 2 / (harm ** 2 + perc ** 2 + 1e-12), 0, 1)
+    mag = np.abs(Z).mean(axis=0)
+    harm = median_filter(mag, size=(1, 17))
+    perc = median_filter(mag, size=(17, 1))
+    h_mask = np.clip(harm ** 2 / (harm ** 2 + perc ** 2 + 1e-12), 0, 1)[None]
+    p_mask = np.clip(perc ** 2 / (harm ** 2 + perc ** 2 + 1e-12), 0, 1)[None]
     return h_mask, p_mask
 
 
