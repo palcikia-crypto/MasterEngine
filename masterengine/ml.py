@@ -168,6 +168,8 @@ class SettingsModel:
         cur = analysis.balance_vector(feats_out)
         order = [f"{a}-{b}" for a, b in dsp.BANDS]
         for i, key in enumerate(order):
+            if p.get("_user"):
+                break
             if key not in p["band_gains_db"]:
                 continue
             ref = REFERENCE_BALANCE.get(key, -10.0)

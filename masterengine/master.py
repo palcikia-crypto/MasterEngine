@@ -87,6 +87,7 @@ def process(x, sr, params=None, refine_iters=7, save_experience=True) -> dict:
     else:
         p = MODEL.sanitize(dict(params))
         p["target_lufs"] = params.get("target_lufs", ml.TARGET_LUFS)
+        p["_user"] = True
 
     pre_db = float(np.clip(-18.0 - feats_in["lufs"], -20.0, 20.0))
     x = x * (10.0 ** (pre_db / 20.0))

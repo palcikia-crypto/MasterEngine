@@ -47,7 +47,7 @@ async def _separate_stems():
 
 
 async def run_master_async():
-    from masterengine import analysis, master
+    from masterengine import analysis, master, stems
     cfg = json.loads(globals()["me_cfg"])
     x, sr_ = _X, _SR
     out = {"frames": []}

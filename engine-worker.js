@@ -42,7 +42,7 @@ self.onmessage = async (e) => {
       py.globals.set("me_in", new Uint8Array(d.buf));
       await py.runPythonAsync(`set_audio(me_in.to_bytes(), ${d.n}, ${d.sr})`);
       if (!py.globals.has("_X")) throw new Error("движок не принял аудио");
-      py.globals.set("me_cfg", JSON.stringify({ stems: !!d.stems, iters: d.iters || 6 }));
+      py.globals.set("me_cfg", JSON.stringify({ stems: !!d.stems, iters: d.iters || 6, params: d.params || null }));
       pendingResult = null;
       const out = await py.runPythonAsync("await run_master_async()");
       let json = pendingResult || out;
