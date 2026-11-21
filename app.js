@@ -31,6 +31,8 @@ function ensureWorker() {
       $("#stemsOn").disabled = false;
       status("Движок готов — бросай трек, обработаю сам", false, true, 100);
     } else if (m.t === "result") {
+      for (const u of Object.values(urlCache)) { try { URL.revokeObjectURL(u); } catch (_) {} }
+      urlCache = {};
       blobs = {};
       for (const [p, buf] of Object.entries(m.files)) blobs[p] = buf;
       lastRes = m.res;
@@ -61,6 +63,7 @@ async function load(file) {
     const buf = await file.arrayBuffer();
     const ctx = new (window.AudioContext || window.webkitAudioContext)();
     const ab = await ctx.decodeAudioData(buf);
+    if (ctx.close) ctx.close();
     sr = ab.sampleRate;
     const L = ab.getChannelData(0);
     const R = ab.numberOfChannels > 1 ? ab.getChannelData(1) : L;
@@ -69,9 +72,11 @@ async function load(file) {
     interleaved.set(L, 0); interleaved.set(R, nSamples);
     const keep = interleaved.slice();
     audioData = { copy: keep, duration: ab.duration };
-    const stems = $("#stemsOn").checked;
+    let stems = $("#stemsOn").checked;
+    const stemsTooLong = stems && ab.duration > 150;
+    if (stemsTooLong) { stems = false; $("#stemsOn").checked = false; }
     const iters = nSamples > 44100 * 90 ? 4 : 6;
-    status("Мастерю «" + file.name + "» " + Math.round(ab.duration) + "s — страница живая, работаю в фоне…", false, false, 8);
+    status("Мастерю «" + file.name + "» " + Math.round(ab.duration) + "s — страница живая, работаю в фоне" + (stemsTooLong ? " (дорожки отключил: трек длинный, не влезет в память телефона)" : "") + "…", false, false, 8);
     worker.postMessage({ t: "load", buf: interleaved.buffer, n: nSamples, sr, stems, iters }, [interleaved.buffer]);
     const w = setInterval(() => {
       if (beat !== myBeat) { clearInterval(w); return; }
@@ -85,7 +90,8 @@ async function load(file) {
   }
 }
 
-const blobOf = p => blobs[p] ? URL.createObjectURL(new Blob([blobs[p]], { type: "audio/wav" })) : "";
+let urlCache = {};
+const blobOf = p => blobs[p] ? (urlCache[p] ||= URL.createObjectURL(new Blob([blobs[p]], { type: "audio/wav" }))) : "";
 
 function fmt(v) { return typeof v === "number" ? (Math.abs(v) > 1000 ? v.toFixed(0) : v.toFixed(2)) : v; }
 
@@ -180,6 +186,15 @@ function downloads() {
     d.insertAdjacentHTML("beforeend", `<a class="dl" href="${blobOf("/session/stemm_" + k + ".wav")}" download="stem_${k}_master.wav">⬇ ${N2RU[k]}</a>`);
 }
 
+function pcmMono(u8) {
+  const dv = new DataView(u8.buffer ? u8.buffer : u8, u8.byteOffset || 0, u8.byteLength);
+  const dataOff = 44;
+  const nSmp = Math.floor((u8.byteLength - dataOff) / 4);
+  const data = new Float32Array(Math.max(0, nSmp));
+  for (let i = 0; i < nSmp; i++) data[i] = dv.getInt16(dataOff + i * 4, true) / 32767;
+  return { data, sr: dv.getUint32(24, true) };
+}
+
 function drawWave(u8, isMaster) {
   const dv = new DataView(u8.buffer ? u8.buffer : u8, u8.byteOffset || 0, u8.byteLength);
   const dataOff = 44;
@@ -230,9 +245,8 @@ function fft(re, im) {
 
 async function spectrum() {
   try {
-    const acx = new (window.AudioContext || window.webkitAudioContext)();
-    const [b0, b1] = await Promise.all([acx.decodeAudioData(blobs["/session/original.wav"].slice(0)), acx.decodeAudioData(blobs["/session/mastered.wav"].slice(0))]);
-    const x0 = b0.getChannelData(0), x1 = b1.getChannelData(0);
+    const w0 = pcmMono(blobs["/session/original.wav"]), w1 = pcmMono(blobs["/session/mastered.wav"]);
+    const x0 = w0.data, x1 = w1.data, srate = w0.sr || 44100;
     const N = 4096, frames = 20, hop = Math.max(N, Math.floor(Math.min(x0.length, x1.length) / frames));
     const w = new Float32Array(N); for (let i = 0; i < N; i++) w[i] = 0.54 - 0.46 * Math.cos(2 * Math.PI * i / (N - 1));
     const spec = data => {
@@ -244,7 +258,7 @@ async function spectrum() {
         for (let i = 0; i < N; i++) re[i] = data[base + i] * w[i];
         fft(re, im);
         for (let i = 1; i < N / 2; i++) {
-          const f = i * acx.sampleRate / N;
+          const f = i * srate / N;
           const b = Math.max(0, Math.min(55, Math.floor(Math.log2(f / 31) * 10)));
           const m = 20 * Math.log10(Math.hypot(re[i], im[i]) / (N / 4) + 1e-9);
           if (m > out[b]) out[b] = m;
@@ -262,6 +276,5 @@ async function spectrum() {
       g.fillStyle = "#38507a"; g.fillRect(i * W + 1, c.height - hA, W - 2, hA);
       g.fillStyle = "#3fe0b0"; g.fillRect(i * W + 1, c.height - hB, W - 2, hB);
     }
-    acx.close();
   } catch (e) { /* спектр — косметика */ }
 }

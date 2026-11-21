@@ -1,5 +1,5 @@
 /* MasterEngine service worker — offline + instant loads + auto-updates. */
-const VERSION = "me-v3";
+const VERSION = "me-v4";
 const BASE = new URL("./", self.location.href);
 const ASSETS = [
   "./",

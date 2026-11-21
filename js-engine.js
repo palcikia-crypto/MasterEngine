@@ -135,21 +135,19 @@
   }
 
   // ------------------------------------------------- Dynamics (block-rate) --
-  function blockEnvPeak(x, block) {
-    const n = x.n, m = Math.floor(n / block) * block;
-    if (m === 0) return { env: new Float64Array([1]), m, block };
-    const cnt = m / block;
-    const env = new Float64Array(cnt);
+  function blockEnvPeakArr(env, x, block) {
+    const n = x.n, cnt = env.length, m = Math.min(cnt * block, n);
     for (let c = 0; c < cnt; c++) {
+      const s = c * block;
       let peak = 0;
-      const s = c * block, e = s + block;
+      const e = Math.min(s + block, m);
       for (let i = s; i < e; i++) {
         const al = Math.abs(x.L[i]); if (al > peak) peak = al;
         const ar = Math.abs(x.R[i]); if (ar > peak) peak = ar;
       }
       env[c] = peak;
     }
-    return { env, m, block };
+    return env;
   }
   function smoothCoef(ms, ctrlSr) { return ms <= 0 ? 1.0 : 1 - Math.exp(-1000 / (ms * ctrlSr)); }
   function smoothTargets(targets, attackMs, releaseMs, ctrlSr) {
@@ -163,25 +161,19 @@
     }
     return out;
   }
-  function upsampleGain(gain, n, block) {
-    const out = new Float64Array(n), len = gain.length;
-    if (!len) { out.fill(1); return out; }
-    for (let i = 0; i < n; i++) {
+  function makeGainAt(gainLin, n, block) {
+    const len = gainLin.length;
+    if (!len) return () => 1;
+    if (len === 1) return () => gainLin[0];
+    return i => {
       const pos = (i - 0.5 * block) / block;
-      if (pos <= 0) out[i] = gain[0];
-      else if (pos >= len - 1) out[i] = gain[len - 1];
-      else {
-        const j = Math.floor(pos), t = pos - j;
-        out[i] = gain[j] + t * (gain[j + 1] - gain[j]);
-      }
-    }
-    return out;
+      if (pos <= 0) return gainLin[0];
+      if (pos >= len - 1) return gainLin[len - 1];
+      const j = pos | 0;
+      return gainLin[j] + (pos - j) * (gainLin[j + 1] - gainLin[j]);
+    };
   }
-
-  function compress(x, sr, thrDb, ratio, attackMs, releaseMs, makeupDb, kneeDb, block) {
-    block = block || 256; kneeDb = kneeDb == null ? 6 : kneeDb;
-    const { env, m } = blockEnvPeak(x, block);
-    const ctrlSr = sr / block;
+  function compGainCurve(env, ctrlSr, thrDb, ratio, attackMs, releaseMs, kneeDb) {
     const lin = 1 - 1 / ratio;
     const g = new Float64Array(env.length);
     for (let i = 0; i < env.length; i++) {
@@ -193,14 +185,21 @@
     const sm = smoothTargets(g, attackMs, releaseMs, ctrlSr);
     const gainLin = new Float64Array(env.length);
     for (let i = 0; i < env.length; i++) gainLin[i] = Math.pow(10, -sm[i] / 20);
-    const gain = upsampleGain(gainLin, x.n, block);
+    return gainLin;
+  }
+
+  function compress(x, sr, thrDb, ratio, attackMs, releaseMs, makeupDb, kneeDb, block) {
+    block = block || 256; kneeDb = kneeDb == null ? 6 : kneeDb;
+    const cnt = Math.max(1, Math.floor(x.n / block));
+    const env = blockEnvPeakArr(new Float64Array(cnt), x, block);
+    const gainLin = compGainCurve(env, sr / block, thrDb, ratio, attackMs, releaseMs, kneeDb);
     const mk = Math.pow(10, (makeupDb || 0) / 20);
-    const y = planar64(x.n);
+    const gAt = makeGainAt(gainLin, x.n, block);
     for (let i = 0; i < x.n; i++) {
-      const gi = (i < m ? gain[i] : (m > 0 ? gain[m - 1] : 1)) * mk;
-      y.L[i] = x.L[i] * gi; y.R[i] = x.R[i] * gi;
+      const gi = gAt(i) * mk;
+      x.L[i] *= gi; x.R[i] *= gi;
     }
-    return y;
+    return x;
   }
 
   function limit(x, sr, ceilingDb, lookaheadMs, attackMs, releaseMs, block) {
@@ -209,32 +208,27 @@
     attackMs = attackMs == null ? 0.05 : attackMs;
     releaseMs = releaseMs == null ? 80 : releaseMs;
     block = block || 32;
-    const { env, m } = blockEnvPeak(x, block);
+    const cnt = Math.max(1, Math.floor(x.n / block));
+    const env = blockEnvPeakArr(new Float64Array(cnt), x, block);
     const ctrlSr = sr / block;
     const thr = Math.pow(10, ceilingDb / 20);
-    const needDb = new Float64Array(env.length);
-    for (let i = 0; i < env.length; i++) {
-      needDb[i] = Math.min(0, db(Math.min(1, thr / Math.max(env[i], EPS))));
-    }
+    const needDb = new Float64Array(cnt);
+    for (let i = 0; i < cnt; i++) needDb[i] = Math.min(0, db(Math.min(1, thr / Math.max(env[i], EPS))));
     const nLook = Math.max(1, Math.round(lookaheadMs * ctrlSr));
-    const shifted = new Float64Array(env.length);
-    for (let i = 0; i < env.length; i++) shifted[i] = i >= nLook ? needDb[i - nLook] : 0;
+    const shifted = new Float64Array(cnt);
+    for (let i = 0; i < cnt; i++) shifted[i] = i >= nLook ? needDb[i - nLook] : 0;
     const sm = smoothTargets(shifted, attackMs, releaseMs, ctrlSr);
-    const gDb = new Float64Array(env.length);
-    for (let i = 0; i < env.length; i++) {
+    const gainLin = new Float64Array(cnt);
+    for (let i = 0; i < cnt; i++) {
       const s = Math.max(-sm[i], 0);
-      gDb[i] = Math.min(-s, needDb[i]);
+      gainLin[i] = Math.pow(10, Math.min(-s, needDb[i]) / 20);
     }
-    const gainLin = new Float64Array(env.length);
-    for (let i = 0; i < env.length; i++) gainLin[i] = Math.pow(10, gDb[i] / 20);
-    const gain = upsampleGain(gainLin, x.n, block);
-    const tail = Math.pow(10, gDb[gDb.length - 1] / 20);
-    const y = planar64(x.n);
+    const gAt = makeGainAt(gainLin, x.n, block);
     for (let i = 0; i < x.n; i++) {
-      const gi = i < m ? gain[i] : tail;
-      y.L[i] = x.L[i] * gi; y.R[i] = x.R[i] * gi;
+      const gi = gAt(i);
+      x.L[i] *= gi; x.R[i] *= gi;
     }
-    return y;
+    return x;
   }
 
   // 4x Catmull-Rom interpolated peak (approximates sinc-over true peak within ~0.1 dB)
@@ -258,17 +252,82 @@
     }
     return db(peak);
   }
+  function reGainIP(x, g) {
+    for (let i = 0; i < x.n; i++) { x.L[i] *= g; x.R[i] *= g; }
+    return x;
+  }
   function limitTo(x, sr, ceilingDb) {
-    let y = limit(x, sr, ceilingDb);
+    limit(x, sr, ceilingDb);
     for (let k = 0; k < 4; k++) {
-      const tp = truePeakLin(y);
+      const tp = truePeakLin(x);
       if (tp <= ceilingDb + 0.03) break;
-      y = reGain(y, Math.pow(10, (ceilingDb - 0.05 - tp) / 20));
+      reGainIP(x, Math.pow(10, (ceilingDb - 0.05 - tp) / 20));
     }
-    return y;
+    return x;
   }
 
   // ------------------------------------------------------------ Multiband --
+  function casc2(b, a) { return [biquadStep(b, a), biquadStep(b, a)]; }
+  function biquadStep(b, a) {
+    let x1 = 0, x2 = 0, y1 = 0, y2 = 0;
+    const b0 = b[0], b1 = b[1], b2 = b[2], a1 = a[1], a2 = a[2];
+    return v => {
+      const y = b0 * v + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2;
+      x2 = x1; x1 = v; y2 = y1; y1 = y;
+      return y;
+    };
+  }
+  function stageSet(k) { const s = []; for (let i = 0; i < k; i++) s.push(new Float64Array(4)); return s; }
+  const ME_BLOCK = 65536;
+  function runStages(src, scratch, n, coeffs, states) {
+    let S = src;
+    for (let s = 0; s < states.length; s++) {
+      const o = states[s], D = scratch[s], ba = coeffs[s], b = ba[0], a = ba[1];
+      const b0 = b[0], b1 = b[1], b2 = b[2], a1 = a[1], a2 = a[2];
+      let x1 = o[0], x2 = o[1], y1 = o[2], y2 = o[3];
+      for (let i = 0; i < n; i++) {
+        const xi = S[i];
+        const yi = b0 * xi + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2;
+        x2 = x1; x1 = xi; y2 = y1; y1 = yi;
+        D[i] = yi;
+      }
+      o[0] = x1; o[1] = x2; o[2] = y1; o[3] = y2;
+      S = D;
+    }
+    return S;
+  }
+  function runStagesPP(src, sA, sB, n, coeffs, states) {
+    let S = src;
+    for (let s = 0; s < states.length; s++) {
+      const o = states[s], D = (s & 1) === 0 ? sA : sB, ba = coeffs[s], b = ba[0], a = ba[1];
+      const b0 = b[0], b1 = b[1], b2 = b[2], a1 = a[1], a2 = a[2];
+      let x1 = o[0], x2 = o[1], y1 = o[2], y2 = o[3];
+      for (let i = 0; i < n; i++) {
+        const xi = S[i];
+        const yi = b0 * xi + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2;
+        x2 = x1; x1 = xi; y2 = y1; y1 = yi;
+        D[i] = yi;
+      }
+      o[0] = x1; o[1] = x2; o[2] = y1; o[3] = y2;
+      S = D;
+    }
+    return S;
+  }
+  function gainInterp(A, last, pos) {
+    if (pos <= 0) return A[0];
+    if (pos >= last) return A[last];
+    const j = pos | 0;
+    return A[j] + (pos - j) * (A[j + 1] - A[j]);
+  }
+  function peakBlocks(env, arr, block) {
+    const cnt = env.length, m = Math.min(cnt * block, arr.length);
+    for (let c = 0; c < cnt; c++) {
+      const s = c * block, e = Math.min(s + block, m);
+      let p = 0;
+      for (let i = s; i < e; i++) { const a = Math.abs(arr[i]); if (a > p) p = a; }
+      if (p > env[c]) env[c] = p;
+    }
+  }
   function multibandCompress(x, sr, crossovers, bands) {
     crossovers = crossovers || [180, 2500];
     bands = bands || [
@@ -276,16 +335,48 @@
       { thr_db: -20, ratio: 2.0, attack_ms: 8, release_ms: 120 },
       { thr_db: -22, ratio: 2.5, attack_ms: 5, release_ms: 100 },
     ];
-    const lo = lr4Split(x, sr, crossovers[0], "lp");
-    const midFull = lr4Split(x, sr, crossovers[0], "hp");
-    const mid = lr4Split(midFull, sr, crossovers[1], "lp");
-    const hi = lr4Split(midFull, sr, crossovers[1], "hp");
-    const parts = [lo, mid, hi];
-    const out = planar64(x.n);
-    for (let i = 0; i < 3; i++) {
-      const b = bands[i];
-      const y = compress(parts[i], sr, b.thr_db, b.ratio, b.attack_ms, b.release_ms, 0, 6, 256);
-      for (let j = 0; j < x.n; j++) { out.L[j] += y.L[j]; out.R[j] += y.R[j]; }
+    const n = x.n;
+    const x0 = clip(crossovers[0], 10, sr * 0.49), x1 = clip(crossovers[1], 10, sr * 0.49);
+    const [blo, alo] = butter2(sr, x0, "lp");
+    const [bhi, ahi] = butter2(sr, x0, "hp");
+    const [mlo, amlo] = butter2(sr, x1, "lp");
+    const [mhi, amhi] = butter2(sr, x1, "hp");
+    const block = 256, cnt = Math.max(1, Math.floor(n / block)), ctrlSr = sr / block;
+    const envLo = new Float64Array(cnt), envMid = new Float64Array(cnt), envHi = new Float64Array(cnt);
+    const midFull = planar32(n);
+    const t1 = new Float32Array(n), t2 = new Float32Array(n), t3 = new Float32Array(n);
+    const bio = [[blo, alo], [blo, alo]], bhp = [[bhi, ahi], [bhi, ahi]];
+    const mio = [[mlo, amlo], [mlo, amlo]], mhp = [[mhi, amhi], [mhi, amhi]];
+    runStages(x.L, [t1, t2], n, bio, stageSet(2));
+    runStages(x.R, [t1, t3], n, bio, stageSet(2));
+    peakBlocks(envLo, t2, block); peakBlocks(envLo, t3, block);
+    runStages(x.L, [t1, midFull.L], n, bhp, stageSet(2));
+    runStages(x.R, [t1, midFull.R], n, bhp, stageSet(2));
+    runStages(midFull.L, [t1, t2], n, mio, stageSet(2));
+    peakBlocks(envMid, t2, block);
+    runStages(midFull.R, [t1, t2], n, mio, stageSet(2));
+    peakBlocks(envMid, t2, block);
+    runStages(midFull.L, [t1, t2], n, mhp, stageSet(2));
+    peakBlocks(envHi, t2, block);
+    runStages(midFull.R, [t1, t2], n, mhp, stageSet(2));
+    peakBlocks(envHi, t2, block);
+    const gLoA = compGainCurve(envLo, ctrlSr, bands[0].thr_db, bands[0].ratio, bands[0].attack_ms, bands[0].release_ms, 6);
+    const gMidA = compGainCurve(envMid, ctrlSr, bands[1].thr_db, bands[1].ratio, bands[1].attack_ms, bands[1].release_ms, 6);
+    const gHiA = compGainCurve(envHi, ctrlSr, bands[2].thr_db, bands[2].ratio, bands[2].attack_ms, bands[2].release_ms, 6);
+    const gL1 = gLoA.length - 1, gL2 = gMidA.length - 1, gL3 = gHiA.length - 1;
+    const invB = 1 / block;
+    const out = planar32(n);
+    for (const chn of ["L", "R"]) {
+      const src = x[chn], mid = midFull[chn], dst = out[chn];
+      runStages(src, [t1, t3], n, bio, stageSet(2));
+      runStages(mid, [t2, t1], n, mio, stageSet(2));
+      runStages(mid, [t2, t2], n, mhp, stageSet(2));
+      for (let i = 0; i < n; i++) {
+        const pos = i * invB - 0.5;
+        dst[i] = t3[i] * gainInterp(gLoA, gL1, pos)
+               + t1[i] * gainInterp(gMidA, gL2, pos)
+               + t2[i] * gainInterp(gHiA, gL3, pos);
+      }
     }
     return out;
   }
@@ -294,134 +385,201 @@
   function saturate(x, drive, mix) {
     drive = drive == null ? 1.5 : drive; mix = mix == null ? 1 : mix;
     const gd = 1 + drive * 3, norm = Math.max(drive, EPS);
-    const y = planar64(x.n);
     for (let i = 0; i < x.n; i++) {
-      y.L[i] = x.L[i] * (1 - mix) + Math.tanh(x.L[i] * gd) / norm * mix;
-      y.R[i] = x.R[i] * (1 - mix) + Math.tanh(x.R[i] * gd) / norm * mix;
+      const l = x.L[i], r = x.R[i];
+      x.L[i] = l * (1 - mix) + Math.tanh(l * gd) / norm * mix;
+      x.R[i] = r * (1 - mix) + Math.tanh(r * gd) / norm * mix;
     }
-    return y;
+    return x;
   }
   function excite(x, sr, freq, drive, mix) {
     drive = drive == null ? 2.5 : drive;
-    const high = lr4Split(x, sr, freq, "hp");
+    const [b, a] = butter2(sr, clip(freq == null ? 3000 : freq, 10, sr * 0.49), "hp");
     const dmin = Math.min(drive, 1.0);
-    const y = planar64(x.n);
+    const sL = casc2(b, a), sR = casc2(b, a);
     for (let i = 0; i < x.n; i++) {
-      const hL = high.L[i], hR = high.R[i];
+      const hL = sL[1](sL[0](x.L[i])), hR = sR[1](sR[0](x.R[i]));
       const harL = Math.tanh(Math.tanh(hL * drive) - hL * dmin) * 0.8;
       const harR = Math.tanh(Math.tanh(hR * drive) - hR * dmin) * 0.8;
-      y.L[i] = x.L[i] + harL * mix * 0.2;
-      y.R[i] = x.R[i] + harR * mix * 0.2;
+      x.L[i] += harL * mix * 0.2;
+      x.R[i] += harR * mix * 0.2;
     }
-    return y;
+    return x;
   }
   function deEss(x, sr, freq, amount) {
-    const s = lr4Split(x, sr, freq, "hp");
-    const y = compress(s, sr, -26, 4, 1, 60, 0, 6, 256);
-    const out = planar64(x.n);
+    const [b, a] = butter2(sr, clip(freq == null ? 6500 : freq, 10, sr * 0.49), "hp");
+    const block = 256, cnt = Math.max(1, Math.floor(x.n / block));
+    const env = new Float64Array(cnt);
+    const sL = casc2(b, a), sR = casc2(b, a);
     for (let i = 0; i < x.n; i++) {
-      out.L[i] = x.L[i] + (y.L[i] - s.L[i]) * amount;
-      out.R[i] = x.R[i] + (y.R[i] - s.R[i]) * amount;
+      const hL = sL[1](sL[0](x.L[i])), hR = sR[1](sR[0](x.R[i]));
+      const c = i < block * cnt ? i / block | 0 : cnt - 1;
+      const pL = Math.abs(hL), pR = Math.abs(hR);
+      if (pL > env[c]) env[c] = pL;
+      if (pR > env[c]) env[c] = pR;
     }
-    return out;
+    const gainLin = compGainCurve(env, sr / block, -26, 4, 1, 60, 6);
+    const gAt = makeGainAt(gainLin, x.n, block);
+    const sL2 = casc2(b, a), sR2 = casc2(b, a);
+    for (let i = 0; i < x.n; i++) {
+      const hL = sL2[1](sL2[0](x.L[i])), hR = sR2[1](sR2[0](x.R[i]));
+      const g = gAt(i);
+      x.L[i] += hL * (g - 1) * amount;
+      x.R[i] += hR * (g - 1) * amount;
+    }
+    return x;
   }
 
   // ---------------------------------------------------------------- Stereo --
-  function fftConvolveSame(sig, kernel) {
-    const n = sig.length, k = kernel.length, size = nextPow2(n + k);
-    const re = new Float64Array(size), im = new Float64Array(size);
-    re.set(sig);
-    const kre = new Float64Array(size), kim = new Float64Array(size);
+  function convolveSameOLA(sig, kernel) {
+    const n = sig.length, k = kernel.length, start = (k - 1) >> 1;
+    const chunk = 16384;
+    const F = nextPow2(chunk + k);
+    const kre = new Float64Array(F), kim = new Float64Array(F);
     kre.set(kernel);
-    fftInOut(re, im, size, false);
-    fftInOut(kre, kim, size, false);
-    for (let i = 0; i < size; i++) {
-      const rr = re[i] * kre[i] - im[i] * kim[i];
-      im[i] = re[i] * kim[i] + im[i] * kre[i];
-      re[i] = rr;
+    fftInOut(kre, kim, F, false);
+    const re = new Float64Array(F), im = new Float64Array(F);
+    const out = new Float64Array(n);
+    for (let c0 = 0; c0 < n; c0 += chunk) {
+      const cLen = Math.min(chunk, n - c0);
+      re.fill(0); im.fill(0);
+      for (let i = 0; i < cLen; i++) re[i] = sig[c0 + i];
+      fftInOut(re, im, F, false);
+      for (let i = 0; i < F; i++) {
+        const rr = re[i] * kre[i] - im[i] * kim[i];
+        im[i] = re[i] * kim[i] + im[i] * kre[i];
+        re[i] = rr;
+      }
+      fftInOut(re, im, F, true);
+      for (let i = 0; i < cLen + k - 1; i++) {
+        const j = c0 + i - start;
+        if (j >= 0 && j < n) out[j] += re[i];
+      }
     }
-    fftInOut(re, im, size, true);
-    const start = (k - 1) >> 1, out = new Float64Array(n);
-    for (let i = 0; i < n; i++) out[i] = re[start + i];
     return out;
   }
   function widen(x, sr, width, bassMonoHz) {
     const n = x.n;
-    const mid = new Float64Array(n), side = new Float64Array(n);
-    for (let i = 0; i < n; i++) { mid[i] = (x.L[i] + x.R[i]) / 2; side[i] = x.L[i] - x.R[i]; }
-    let midW = mid;
-    if (bassMonoHz > 0) {
-      const fc = clip(bassMonoHz, 10, sr * 0.49);
-      const [bp, ba] = butter2(sr, fc, "lp");
-      const midLp = applyBiquadCh(applyBiquadCh(mid, bp, ba), bp, ba);
-      const bass = midLp;
-      const nw = new Float64Array(n);
-      for (let i = 0; i < n; i++) nw[i] = mid[i] - midLp[i] + bass[i];
-      midW = nw;
+    for (let i = 0; i < n; i++) {
+      const l = x.L[i], r = x.R[i];
+      x.L[i] = l - r;
+      x.R[i] = (l + r) / 2;
     }
-    let wide;
+    const side = x.L, mid = x.R;
     if (width !== 1) {
       const amt = width - 1, fl = Math.floor(0.012 * sr);
+      let wide;
       if (fl > 3) {
         const wl = Math.min(fl >> 1, 8192);
         const k = new Float64Array(wl);
         let sum = 0;
         for (let i = 0; i < wl; i++) { const v = 0.5 - 0.5 * Math.cos(2 * Math.PI * i / (2 * fl)); k[i] = v; sum += v; }
         for (let i = 0; i < wl; i++) k[i] = k[i] / sum * amt;
-        wide = fftConvolveSame(side, k);
+        wide = convolveSameOLA(side, k);
       } else {
         wide = new Float64Array(n);
         for (let i = 0; i < n; i++) wide[i] = side[i] * amt;
       }
+      for (let i = 0; i < n; i++) {
+        const t = 0.5 * (side[i] + wide[i]);
+        const l = mid[i] - t, r = mid[i] + t;
+        side[i] = l; mid[i] = r;
+      }
     } else {
-      wide = new Float64Array(n);
+      for (let i = 0; i < n; i++) {
+        const t = 0.5 * side[i];
+        const l = mid[i] - t, r = mid[i] + t;
+        side[i] = l; mid[i] = r;
+      }
     }
-    const y = planar64(n);
-    for (let i = 0; i < n; i++) {
-      y.L[i] = midW[i] - 0.5 * side[i] - 0.5 * wide[i];
-      y.R[i] = midW[i] + 0.5 * side[i] + 0.5 * wide[i];
-    }
-    return y;
+    return x;
   }
 
   // -------------------------------------------------------------- Metering --
-  function kWeightShelf(x, sr) {
-    const [b, a] = biquadShelf(sr, 1681.97, 3.99984385397, 0.7071752369554196, true);
-    return applyBiquad(x, b, a);
+  const _kwCache = {};
+  function kCoeffs(sr) {
+    if (!_kwCache[sr]) {
+      const [bs, as_] = biquadShelf(sr, 1681.97, 3.999843853973363, 0.7071752369554196, true);
+      const [bh, ah] = butter2(sr, 38.0, "hp");
+      _kwCache[sr] = [[bs, as_], [bh, ah], [bh, ah]];
+    }
+    return _kwCache[sr];
   }
-  function kWeightHpf(x, sr) {
-    const [b, a] = butter2(sr, 38.0, "hp");
-    return applyBiquad(applyBiquad(x, b, a), b, a);
+  function kWeightScan(x, sr, collectHops) {
+    const coeffs = kCoeffs(sr);
+    const stL = stageSet(3), stR = stageSet(3);
+    const sc = [new Float64Array(ME_BLOCK), new Float64Array(ME_BLOCK), new Float64Array(ME_BLOCK)];
+    const hop = Math.max(1, Math.floor(0.100 * sr));
+    let sum = 0, hopAcc = 0, hopCnt = 0, hopIdx = 0;
+    const ring = new Float64Array(4);
+    const hopE = collectHops ? [] : null;
+    for (let off = 0; off < x.n; off += ME_BLOCK) {
+      const len = Math.min(ME_BLOCK, x.n - off);
+      const oL = runStages(x.L.subarray(off, off + len), sc, len, coeffs, stL);
+      for (let i = 0; i < len; i++) {
+        const v = oL[i];
+        sum += v * v;
+        if (collectHops) {
+          hopAcc += v * v;
+          if (++hopCnt === hop) { hopCnt = 0; ring[hopIdx & 3] = hopAcc; hopAcc = 0; if (hopIdx >= 3) hopE.push((ring[0] + ring[1] + ring[2] + ring[3]) / (4 * hop)); hopIdx++; }
+        }
+      }
+      const oR = runStages(x.R.subarray(off, off + len), sc, len, coeffs, stR);
+      for (let i = 0; i < len; i++) {
+        const v = oR[i];
+        sum += v * v;
+        if (collectHops) {
+          hopAcc += v * v;
+          if (++hopCnt === hop) { hopCnt = 0; ring[hopIdx & 3] = hopAcc; hopAcc = 0; if (hopIdx >= 3) hopE.push((ring[0] + ring[1] + ring[2] + ring[3]) / (4 * hop)); hopIdx++; }
+        }
+      }
+    }
+    return { sum, hopE };
   }
   function lufs(x, sr) {
-    const y = kWeightHpf(kWeightShelf(x, sr), sr);
-    let s = 0;
-    for (let i = 0; i < x.n; i++) s += y.L[i] * y.L[i] + y.R[i] * y.R[i];
-    return -0.691 + 10 * Math.log10(s / x.n + EPS);
-  }
-  function kWeighted(x, sr) {
-    return kWeightHpf(kWeightShelf(x, sr), sr);
+    const r = kWeightScan(x, sr, false);
+    return -0.691 + 10 * Math.log10(r.sum / x.n + EPS);
   }
   function lufsGated(x, sr) {
     const size = Math.floor(0.400 * sr);
     if (x.n < size) return lufs(x, sr);
-    const y = kWeighted(x, sr);
-    const hop = Math.floor(0.100 * sr);
-    const blocks = [];
-    for (let i = 0; i + size <= x.n; i += hop) {
-      let s = 0;
-      for (let j = i; j < i + size; j++) s += y.L[j] * y.L[j] + y.R[j] * y.R[j];
-      blocks.push(s / size);
-    }
-    const lg = blocks.map(b => -0.691 + 10 * Math.log10(b + EPS));
+    const { hopE } = kWeightScan(x, sr, true);
+    const lg = new Array(hopE.length);
+    for (let i = 0; i < hopE.length; i++) lg[i] = -0.691 + 10 * Math.log10(hopE[i] + EPS);
     const absIdx = [];
-    for (let i = 0; i < blocks.length; i++) if (lg[i] > -70) absIdx.push(i);
+    for (let i = 0; i < hopE.length; i++) if (lg[i] > -70) absIdx.push(i);
     if (!absIdx.length) return -70;
-    const meanAbs = absIdx.reduce((acc, i) => acc + blocks[i], 0) / absIdx.length;
+    let meanAbs = 0;
+    for (let i = 0; i < absIdx.length; i++) meanAbs += hopE[absIdx[i]];
+    meanAbs /= absIdx.length;
     const rel = -0.691 + 10 * Math.log10(meanAbs + EPS);
-    const gIdx = absIdx.filter(i => lg[i] > rel - 10);
-    if (!gIdx.length) return absIdx.reduce((acc, i) => acc + lg[i], 0) / absIdx.length;
-    return -0.691 + 10 * Math.log10(gIdx.reduce((acc, i) => acc + blocks[i], 0) / gIdx.length + EPS);
+    const gIdx = [];
+    for (let i = 0; i < absIdx.length; i++) if (lg[absIdx[i]] > rel - 10) gIdx.push(absIdx[i]);
+    if (!gIdx.length) {
+      let acc = 0;
+      for (let i = 0; i < absIdx.length; i++) acc += lg[absIdx[i]];
+      return acc / absIdx.length;
+    }
+    let acc = 0;
+    for (let i = 0; i < gIdx.length; i++) acc += hopE[gIdx[i]];
+    return -0.691 + 10 * Math.log10(acc / gIdx.length + EPS);
+  }
+  function bandEnergyDb(x, sr, fmin, fmax) {
+    fmin = Math.max(fmin, 12); fmax = Math.min(fmax, sr / 2 - 1);
+    const [b1, a1] = butter2(sr, fmin, "hp");
+    const [b2, a2] = butter2(sr, fmax, "lp");
+    const coeffs = [[b1, a1], [b1, a1], [b2, a2], [b2, a2]];
+    const stL = stageSet(4), stR = stageSet(4);
+    const sc = [new Float64Array(ME_BLOCK), new Float64Array(ME_BLOCK), new Float64Array(ME_BLOCK), new Float64Array(ME_BLOCK)];
+    let s = 0;
+    for (let off = 0; off < x.n; off += ME_BLOCK) {
+      const len = Math.min(ME_BLOCK, x.n - off);
+      const oL = runStages(x.L.subarray(off, off + len), sc, len, coeffs, stL);
+      for (let i = 0; i < len; i++) s += oL[i] * oL[i];
+      const oR = runStages(x.R.subarray(off, off + len), sc, len, coeffs, stR);
+      for (let i = 0; i < len; i++) s += oR[i] * oR[i];
+    }
+    return db(Math.sqrt(s / (2 * x.n) + EPS));
   }
   function crestFactor(x) {
     let peak = 0, s = 0;
@@ -441,13 +599,6 @@
     }
     em = Math.sqrt(em / x.n + EPS); es = Math.sqrt(es / x.n + EPS);
     return db(es / em);
-  }
-  function bandEnergyDb(x, sr, fmin, fmax) {
-    fmin = Math.max(fmin, 12); fmax = Math.min(fmax, sr / 2 - 1);
-    const y = lr4Split(lr4Split(x, sr, fmin, "hp"), sr, fmax, "lp");
-    let s = 0;
-    for (let i = 0; i < x.n; i++) s += y.L[i] * y.L[i] + y.R[i] * y.R[i];
-    return db(Math.sqrt(s / (2 * x.n) + EPS));
   }
   function spectralCentroid(x, sr) {
     const N = 4096, hop = N / 2;
@@ -491,8 +642,11 @@
   }
   function balanceVector(feats) {
     const v = BAND_KEYS.map(k => feats.balance_db[k]);
-    const mx = Math.max(...v);
-    return v.map(vi => vi - mx);
+    let mx = -Infinity;
+    for (const vi of v) if (vi > mx) mx = vi;
+    const out = new Array(v.length);
+    for (let i = 0; i < v.length; i++) out[i] = v[i] - mx;
+    return out;
   }
   function publicFeats(f) { const g = Object.assign({}, f); delete g.peak_lin; return g; }
 
@@ -531,6 +685,7 @@
     }).sort((a, b) => a.d - b.d).slice(0, k || 5).map(s => s.e);
   }
   function sanitizeBandGains(p) {
+    if (!p.band_gains_db || typeof p.band_gains_db !== "object") p.band_gains_db = {};
     const bg = {};
     for (const k of BAND_KEYS) if (k in p.band_gains_db) bg[k] = clip(+p.band_gains_db[k] || 0, -6, 6);
     p.band_gains_db = bg;
@@ -548,6 +703,7 @@
     p.target_lufs = clip(p.target_lufs == null ? TARGET_LUFS : +p.target_lufs, -24, -6);
     p.ceiling_dbtp = clip(p.ceiling_dbtp == null ? TARGET_CEILING_DBTP : +p.ceiling_dbtp, -3, -0.1);
     if (!Array.isArray(p.comp) || p.comp.length !== 3) p.comp = defaultParams().comp;
+    if (!Array.isArray(p.xover_hz) || p.xover_hz.length !== 2) p.xover_hz = [180, 2500];
     return p;
   }
   function predict(feats, sr) {
@@ -616,45 +772,320 @@
   }
 
   // -------------------------------------------------------------- Chain ----
-  function applyChain(x, sr, p) {
-    let y = copyPlanar(x);
-    const [hb, ha] = butter2(sr, p.hpf_hz, "hp");
-    y = applyBiquad(y, hb, ha);
+  function copyPreGain(x, g) {
+    const y = planar32(x.n);
+    for (let i = 0; i < x.n; i++) { y.L[i] = x.L[i] * g; y.R[i] = x.R[i] * g; }
+    return y;
+  }
+  function chainCoeffs(sr, p, x) {
+    const coeffs = [butter2(sr, p.hpf_hz, "hp")];
     for (const k of BAND_KEYS) {
       if (!(k in p.band_gains_db)) continue;
       const fmin = +k.split("-")[0], fmax = +k.split("-")[1];
       const g = p.band_gains_db[k];
       if (Math.abs(g) < 0.05) continue;
-      if (fmin <= 60) {
-        const [b, a] = biquadShelf(sr, Math.sqrt(fmin * fmax) * 1.2, g, 0.9, false);
-        y = applyBiquad(y, b, a);
-      } else if (fmax >= 12000) {
-        const [b, a] = biquadShelf(sr, 10000, g, 0.8, true);
-        y = applyBiquad(y, b, a);
-      } else {
-        const f = Math.sqrt(fmin * fmax), q = fmax < 300 ? 1.1 : 0.9;
-        const [b, a] = biquadPeaking(sr, f, g, q);
-        y = applyBiquad(y, b, a);
-      }
+      if (fmin <= 60) coeffs.push(biquadShelf(sr, Math.sqrt(fmin * fmax) * 1.2, g, 0.9, false));
+      else if (fmax >= 12000) coeffs.push(biquadShelf(sr, 10000, g, 0.8, true));
+      else coeffs.push(biquadPeaking(sr, Math.sqrt(fmin * fmax), g, fmax < 300 ? 1.1 : 0.9));
     }
-    y = multibandCompress(y, sr, p.xover_hz, p.comp);
-    if (p.saturation > 0.01) y = saturate(y, p.saturation * 3, 0.5);
-    if (p.exciter.mix > 0.005) y = excite(y, sr, p.exciter.freq == null ? 3000 : p.exciter.freq, 2.5, p.exciter.mix);
-    if (p.de_ess.amount > 0.005) y = deEss(y, sr, p.de_ess.freq == null ? 6500 : p.de_ess.freq, p.de_ess.amount);
-    y = widen(y, sr, p.stereo_width, p.bass_mono_hz);
-    y = reGain(y, Math.pow(10, (p._output_gain_db || 0) / 20));
-    y = limitTo(y, sr, p.ceiling_dbtp);
+    return coeffs;
+  }
+  function applyChain(x, sr, p) {
+    const n = x.n;
+    const coeffs = chainCoeffs(sr, p, x);
+    const K = coeffs.length;
+    const sA = new Float32Array(n), sB = new Float32Array(n);
+    const buf = planar32(n);
+    buf.L.set(runStagesPP(x.L, sA, sB, n, coeffs, stageSet(K)));
+    buf.R.set(runStagesPP(x.R, sA, sB, n, coeffs, stageSet(K)));
+    let y = multibandCompress(buf, sr, p.xover_hz, p.comp);
+    if (p.saturation > 0.01) saturate(y, p.saturation * 3, 0.5);
+    if (p.exciter.mix > 0.005) excite(y, sr, p.exciter.freq == null ? 3000 : p.exciter.freq, 2.5, p.exciter.mix);
+    if (p.de_ess.amount > 0.005) deEss(y, sr, p.de_ess.freq == null ? 6500 : p.de_ess.freq, p.de_ess.amount);
+    widen(y, sr, p.stereo_width, p.bass_mono_hz);
+    reGainIP(y, Math.pow(10, (p._output_gain_db || 0) / 20));
+    limitTo(y, sr, p.ceiling_dbtp);
     return y;
   }
+
+  const STREAM_MIN_SEC = 120, CS = 65536;
+  let _streamScratch = null;
+  function streamScratch() {
+    if (_streamScratch) return _streamScratch;
+    const z = () => new Float32Array(CS);
+    _streamScratch = { t1: z(), t2: z(), t3: z(), t4: z(), loL: z(), loR: z(), mfL: z(), mfR: z(),
+      m2L: z(), m2R: z(), h2L: z(), h2R: z(), eL: z(), eR: z(), dL: z(), dR: z(),
+      seg: new Float32Array(CS + 8320) };
+    return _streamScratch;
+  }
+  function gainPush(car, env, b) {
+    const o = db(env[b]) - car.thr;
+    let t;
+    if (o <= 0) t = 0;
+    else if (o <= car.knee) t = car.lin * o * o / (2 * car.knee);
+    else t = car.lin * (o - car.knee / 2);
+    let g;
+    if (car.filled === 0) g = t;
+    else g = car.g + (t < car.g ? car.ca : car.cr) * (t - car.g);
+    car.g = g; car.filled = b + 1;
+    return Math.pow(10, -g / 20);
+  }
+  function streamRender(x, sr, p) {
+    const n = x.n;
+    const out = planar32(n);
+    const S = streamScratch();
+    const x0 = clip(p.xover_hz[0] == null ? 180 : +p.xover_hz[0], 10, sr * 0.49);
+    const x1 = clip(p.xover_hz[1] == null ? 2500 : +p.xover_hz[1], 10, sr * 0.49);
+    const fil = butter2(sr, x0, "lp"), fih = butter2(sr, x0, "hp");
+    const fml = butter2(sr, x1, "lp"), fmh = butter2(sr, x1, "hp");
+    const bio = [[fil[0], fil[1]], [fil[0], fil[1]]], bhp = [[fih[0], fih[1]], [fih[0], fih[1]]];
+    const mio = [[fml[0], fml[1]], [fml[0], fml[1]]], mhp = [[fmh[0], fmh[1]], [fmh[0], fmh[1]]];
+    const eq = chainCoeffs(sr, p, x);
+    const K = eq.length;
+    const stEqL = stageSet(K), stEqR = stageSet(K);
+    const stLoL = stageSet(2), stLoR = stageSet(2), stMfL = stageSet(2), stMfR = stageSet(2);
+    const stM2L = stageSet(2), stM2R = stageSet(2), stH2L = stageSet(2), stH2R = stageSet(2);
+    const stExL = stageSet(2), stExR = stageSet(2), stDeL = stageSet(2), stDeR = stageSet(2);
+    const exFreq = p.exciter && p.exciter.freq != null ? +p.exciter.freq : 3000;
+    const exa = butter2(sr, clip(exFreq, 10, sr * 0.49), "hp");
+    const exo = [[exa[0], exa[1]], [exa[0], exa[1]]];
+    const deFreq = p.de_ess && p.de_ess.freq != null ? +p.de_ess.freq : 6500;
+    const dea = butter2(sr, clip(deFreq, 10, sr * 0.49), "hp");
+    const dco = [[dea[0], dea[1]], [dea[0], dea[1]]];
+    const exDr = 2.5, exDmin = Math.min(exDr, 1.0), exMix = p.exciter ? +p.exciter.mix || 0 : 0;
+    const deAmt = p.de_ess ? +p.de_ess.amount || 0 : 0;
+
+    const block = 256, invB = 1 / block, ctrlSr = sr / block;
+    const cnt = Math.max(1, Math.floor(n / block));
+    const envLo = new Float64Array(cnt), envMid = new Float64Array(cnt), envHi = new Float64Array(cnt), envDe = new Float64Array(cnt);
+    const cgLo = new Float64Array(cnt), cgMid = new Float64Array(cnt), cgHi = new Float64Array(cnt), cgDe = new Float64Array(cnt);
+    const mkCar = (thrDb, ratio, attackMs, releaseMs) => ({ thr: thrDb, knee: 6, lin: 1 - 1 / ratio, ca: smoothCoef(attackMs, ctrlSr), cr: smoothCoef(releaseMs, ctrlSr), g: 0, filled: 0 });
+    const carLo = mkCar(p.comp[0].thr_db, p.comp[0].ratio, p.comp[0].attack_ms, p.comp[0].release_ms);
+    const carMid = mkCar(p.comp[1].thr_db, p.comp[1].ratio, p.comp[1].attack_ms, p.comp[1].release_ms);
+    const carHi = mkCar(p.comp[2].thr_db, p.comp[2].ratio, p.comp[2].attack_ms, p.comp[2].release_ms);
+    const carDe = mkCar(-26, 4, 1, 60);
+
+    const width = p.stereo_width, amt = width - 1, flW = Math.floor(0.012 * sr);
+    const useConv = width !== 1 && flW > 3;
+    const wl = useConv ? Math.min(flW >> 1, 8192) : 0;
+    const kern = useConv ? new Float64Array(wl) : null;
+    if (useConv) {
+      let sum = 0;
+      for (let i = 0; i < wl; i++) { const v = 0.5 - 0.5 * Math.cos(2 * Math.PI * i / (2 * flW)); kern[i] = v; sum += v; }
+      for (let i = 0; i < wl; i++) kern[i] = kern[i] / sum * amt;
+    }
+    const startW = useConv ? (wl - 1) >> 1 : 0;
+    const cap = CS + wl + 64;
+    const qS = new Float32Array(cap), qM = new Float32Array(cap);
+    const qPL = new Float32Array(cap), qPR = new Float32Array(cap);
+
+    const invL = 1 / 32, ctrlL = sr / 32;
+    const nLook = Math.max(1, Math.round(1.5 * ctrlL));
+    const cntL = Math.max(1, Math.floor(n / 32));
+    const envLm = new Float64Array(cntL), gLim = new Float64Array(cntL);
+    const ca_l = smoothCoef(0.05, ctrlL), cr_l = smoothCoef(80, ctrlL);
+    const thrL = Math.pow(10, (p.ceiling_dbtp == null ? -1 : +p.ceiling_dbtp) / 20);
+    let gLc = 0, limBi = 0, accL = 0, accR = 0, limDone = 0;
+    let jOut = 0, wrNext = 0;
+    const gOut = Math.pow(10, (p._output_gain_db || 0) / 20);
+
+    for (let c0 = 0; c0 < n; c0 += CS) {
+      const c1 = Math.min(n, c0 + CS), len = c1 - c0;
+      const A = S.t3, AR = S.t4;
+      const cL = [], cR = [];
+      for (let i = 0; i < K; i++) { cL.push(i % 3 === 2 ? A : (i % 3 === 0 ? S.t1 : S.t2)); cR.push(i % 3 === 2 ? AR : (i % 3 === 0 ? S.t1 : S.t2)); }
+      const rL = runStages(x.L.subarray(c0, c1), cL, len, eq, stEqL);
+      if (rL !== A) A.set(rL.subarray(0, len));
+      const rR = runStages(x.R.subarray(c0, c1), cR, len, eq, stEqR);
+      if (rR !== AR) AR.set(rR.subarray(0, len));
+
+      const loLv = S.loL, loRv = S.loR, mfLv = S.mfL, mfRv = S.mfR;
+      runStages(A, [S.t1, loLv], len, bio, stLoL);
+      runStages(A, [S.t2, mfLv], len, bhp, stMfL);
+      runStages(AR, [S.t1, loRv], len, bio, stLoR);
+      runStages(AR, [S.t2, mfRv], len, bhp, stMfR);
+      runStages(mfLv, [S.t1, S.m2L], len, mio, stM2L);
+      runStages(mfLv, [S.t2, S.h2L], len, mhp, stH2L);
+      runStages(mfRv, [S.t1, S.m2R], len, mio, stM2R);
+      runStages(mfRv, [S.t2, S.h2R], len, mhp, stH2R);
+      let bi = (c0 / block) | 0, bE = Math.min((bi + 1) * block, n);
+      let pLo = 0, pMid = 0, pHi = 0;
+      const m2Lv = S.m2L, m2Rv = S.m2R, h2Lv = S.h2L, h2Rv = S.h2R;
+      for (let i = 0; i < len; i++) {
+        let u = Math.abs(loLv[i]), v = Math.abs(loRv[i]); if (v > u) u = v; if (u > pLo) pLo = u;
+        u = Math.abs(m2Lv[i]); v = Math.abs(m2Rv[i]); if (v > u) u = v; if (u > pMid) pMid = u;
+        u = Math.abs(h2Lv[i]); v = Math.abs(h2Rv[i]); if (v > u) u = v; if (u > pHi) pHi = u;
+        if (c0 + i + 1 === bE) {
+          const bc = bi < cnt ? bi : cnt - 1;
+          if (pLo > envLo[bc]) envLo[bc] = pLo;
+          if (pMid > envMid[bc]) envMid[bc] = pMid;
+          if (pHi > envHi[bc]) envHi[bc] = pHi;
+          bi++; bE = Math.min((bi + 1) * block, n); pLo = 0; pMid = 0; pHi = 0;
+        }
+      }
+      const bStart = (c0 / block) | 0, bEnd = Math.min(bi, cnt);
+      for (let b = bStart; b < bEnd; b++) {
+        cgLo[b] = gainPush(carLo, envLo, b);
+        cgMid[b] = gainPush(carMid, envMid, b);
+        cgHi[b] = gainPush(carHi, envHi, b);
+      }
+      const dLast = bEnd - 1;
+      const oL = out.L.subarray(c0, c1), oRR = out.R.subarray(c0, c1);
+      for (let i = 0; i < len; i++) {
+        const pos = (c0 + i) * invB - 0.5;
+        oL[i] = loLv[i] * gainInterp(cgLo, dLast, pos) + m2Lv[i] * gainInterp(cgMid, dLast, pos) + h2Lv[i] * gainInterp(cgHi, dLast, pos);
+        oRR[i] = loRv[i] * gainInterp(cgLo, dLast, pos) + m2Rv[i] * gainInterp(cgMid, dLast, pos) + h2Rv[i] * gainInterp(cgHi, dLast, pos);
+      }
+      if (p.saturation > 0.01) {
+        const drv = p.saturation * 3, gd = 1 + drv * 3, norm = Math.max(drv, EPS);
+        for (let i = 0; i < len; i++) {
+          const l = oL[i], r = oRR[i];
+          oL[i] = l * 0.5 + Math.tanh(l * gd) / norm * 0.5;
+          oRR[i] = r * 0.5 + Math.tanh(r * gd) / norm * 0.5;
+        }
+      }
+      if (exMix > 0.005) {
+        const eLv = S.eL, eRv = S.eR;
+        runStages(oL, [S.t1, eLv], len, exo, stExL);
+        runStages(oRR, [S.t2, eRv], len, exo, stExR);
+        for (let i = 0; i < len; i++) {
+          const vl = eLv[i], vr = eRv[i];
+          oL[i] += (Math.tanh(Math.tanh(vl * exDr) - vl * exDmin) * 0.8) * exMix * 0.2;
+          oRR[i] += (Math.tanh(Math.tanh(vr * exDr) - vr * exDmin) * 0.8) * exMix * 0.2;
+        }
+      }
+      if (deAmt > 0.005) {
+        const dLv = S.dL, dRv = S.dR;
+        runStages(oL, [S.t1, dLv], len, dco, stDeL);
+        runStages(oRR, [S.t2, dRv], len, dco, stDeR);
+        let dbi = (c0 / block) | 0, dbE = Math.min((dbi + 1) * block, n), pDe = 0;
+        for (let i = 0; i < len; i++) {
+          const u = Math.abs(dLv[i]), v = Math.abs(dRv[i]); const pk = u > v ? u : v; if (pk > pDe) pDe = pk;
+          if (c0 + i + 1 === dbE) {
+            const bc = dbi < cnt ? dbi : cnt - 1;
+            if (pDe > envDe[bc]) envDe[bc] = pDe;
+            dbi++; dbE = Math.min((dbi + 1) * block, n); pDe = 0;
+          }
+        }
+        const dStart = (c0 / block) | 0, dEnd = Math.min(dbi, cnt);
+        for (let b = dStart; b < dEnd; b++) cgDe[b] = gainPush(carDe, envDe, b);
+        const ddLast = dEnd - 1;
+        if (dEnd > dStart) {
+          for (let i = 0; i < len; i++) {
+            const pos = (c0 + i) * invB - 0.5;
+            const gg = gainInterp(cgDe, ddLast, pos) - 1;
+            oL[i] += dLv[i] * gg * deAmt;
+            oRR[i] += dRv[i] * gg * deAmt;
+          }
+        }
+      }
+      for (let i = 0; i < len; i++) {
+        const sSlot = (c0 + i) % cap;
+        qS[sSlot] = oL[i] - oRR[i];
+        qM[sSlot] = (oL[i] + oRR[i]) / 2;
+      }
+      let cv = null;
+      if (useConv) {
+        for (let p = 0; p < wl; p++) { const m = c0 - wl + p; S.seg[p] = m < 0 ? 0 : qS[m % cap]; }
+        for (let i = 0; i < len; i++) S.seg[wl + i] = qS[(c0 + i) % cap];
+        cv = convolveSameOLA(S.seg.subarray(0, wl + len), kern);
+      }
+      const arrEnd = c1;
+      while (jOut <= arrEnd - 1 - startW && jOut < n) {
+        const sSlot = jOut % cap;
+        const sd = qS[sSlot], md = qM[sSlot];
+        let tp;
+        if (width === 1) tp = 0.5 * sd;
+        else if (useConv) tp = 0.5 * (sd + cv[jOut - c0 + wl]);
+        else tp = 0.5 * (sd + sd * amt);
+        qPL[sSlot] = (md - tp) * gOut;
+        qPR[sSlot] = (md + tp) * gOut;
+        const al = Math.abs(qPL[sSlot]), ar = Math.abs(qPR[sSlot]);
+        if (al > accL) accL = al;
+        if (ar > accR) accR = ar;
+        if (jOut + 1 === (limBi + 1) * 32) {
+          if (limBi < cntL) {
+            envLm[limBi] = Math.max(accL, accR);
+            const nd = Math.min(0, db(Math.min(1, thrL / Math.max(envLm[limBi], EPS))));
+            const sh = limBi >= nLook ? Math.min(0, db(Math.min(1, thrL / Math.max(envLm[limBi - nLook], EPS)))) : 0;
+            gLc += (sh < gLc ? ca_l : cr_l) * (sh - gLc);
+            gLim[limBi] = Math.pow(10, Math.min(gLc, nd) / 20);
+            limDone = limBi + 1; limBi++; accL = 0; accR = 0;
+          }
+        }
+        jOut++;
+      }
+      if (limDone > 1) {
+        const stop = Math.min(n, limDone * 32 - 16);
+        while (wrNext < stop) {
+          const g = gainInterp(gLim, limDone - 1, wrNext * invL - 0.5);
+          const sSlot = wrNext % cap;
+          out.L[wrNext] = qPL[sSlot] * g;
+          out.R[wrNext] = qPR[sSlot] * g;
+          wrNext++;
+        }
+      }
+    }
+    const c0Last = Math.floor((n - 1) / CS) * CS, c1Last = n;
+    let cv2 = null;
+    if (useConv && jOut < n) {
+      for (let p = 0; p < wl; p++) { const m = c0Last - wl + p; S.seg[p] = m < 0 ? 0 : qS[m % cap]; }
+      for (let i = 0; i < c1Last - c0Last; i++) S.seg[wl + i] = qS[(c0Last + i) % cap];
+      cv2 = convolveSameOLA(S.seg.subarray(0, wl + c1Last - c0Last), kern);
+    }
+    while (jOut < n) {
+      const sSlot = jOut % cap;
+      const sd = qS[sSlot], md = qM[sSlot];
+      let tp;
+      if (width === 1) tp = 0.5 * sd;
+      else if (useConv) tp = 0.5 * (sd + cv2[jOut - c0Last + wl]);
+      else tp = 0.5 * (sd + sd * amt);
+      qPL[sSlot] = (md - tp) * gOut;
+      qPR[sSlot] = (md + tp) * gOut;
+      const al = Math.abs(qPL[sSlot]), ar = Math.abs(qPR[sSlot]);
+      if (al > accL) accL = al;
+      if (ar > accR) accR = ar;
+      if (jOut + 1 === (limBi + 1) * 32) {
+        if (limBi < cntL) {
+          envLm[limBi] = Math.max(accL, accR);
+          const nd = Math.min(0, db(Math.min(1, thrL / Math.max(envLm[limBi], EPS))));
+          const sh = limBi >= nLook ? Math.min(0, db(Math.min(1, thrL / Math.max(envLm[limBi - nLook], EPS)))) : 0;
+          gLc += (sh < gLc ? ca_l : cr_l) * (sh - gLc);
+          gLim[limBi] = Math.pow(10, Math.min(gLc, nd) / 20);
+          limDone = limBi + 1; limBi++; accL = 0; accR = 0;
+        }
+      }
+      jOut++;
+    }
+    while (wrNext < n) {
+      const g = gainInterp(gLim, cntL - 1, wrNext * invL - 0.5);
+      const sSlot = wrNext % cap;
+      out.L[wrNext] = qPL[sSlot] * g;
+      out.R[wrNext] = qPR[sSlot] * g;
+      wrNext++;
+    }
+    for (let k2 = 0; k2 < 4; k2++) {
+      const tpv = truePeakLin(out);
+      if (tpv <= (p.ceiling_dbtp == null ? -1 : p.ceiling_dbtp) + 0.03) break;
+      reGainIP(out, Math.pow(10, ((p.ceiling_dbtp == null ? -1 : p.ceiling_dbtp) - 0.05 - tpv) / 20));
+    }
+    for (let i = 0; i < n; i++) {
+      if (!isFinite(out.L[i])) out.L[i] = 0;
+      if (!isFinite(out.R[i])) out.R[i] = 0;
+    }
+    return out;
+  }
+
+  const renderOnce = (x, sr, p) => (x.n >= STREAM_MIN_SEC * sr ? streamRender(x, sr, p) : applyChain(x, sr, p));
   function safeRender(x, sr, p) {
-    let y = applyChain(x, sr, p);
+    let y = renderOnce(x, sr, p);
     let rx = 0, ry = 0;
     for (let i = 0; i < x.n; i++) { rx += x.L[i] * x.L[i] + x.R[i] * x.R[i]; ry += y.L[i] * y.L[i] + y.R[i] * y.R[i]; }
     const ref = Math.sqrt(rx / (2 * x.n)) + 1e-12, cur = Math.sqrt(ry / (2 * x.n));
     if (!isFinite(cur) || cur > ref * 12) {
       const p2 = JSON.parse(JSON.stringify(p));
       p2._output_gain_db = (p2._output_gain_db || 0) - 12;
-      y = applyChain(x, sr, p2);
+      y = renderOnce(x, sr, p2);
     }
     for (let i = 0; i < y.n; i++) {
       if (!isFinite(y.L[i])) y.L[i] = 0;
@@ -692,7 +1123,7 @@
       p = predict(featsIn, sr);
     }
     const preDb = clip(-18 - featsIn.lufs, -20, 20);
-    x = reGain(x, Math.pow(10, preDb / 20));
+    x = copyPreGain(x, Math.pow(10, preDb / 20));
     const iters = opts.iters == null ? 6 : opts.iters;
     let best = null;
     for (let it = 0; it < iters; it++) {
@@ -721,7 +1152,6 @@
       y: best.y,
     };
   }
-
   // --------------------------------------------------------------- Stems ---
   const N_FFT = 4096, HOP = 1024, CHUNK = 262144, OVERLAP = 32768;
   const STEM_ORDER = ["drums", "bass", "vocals", "other"];
@@ -927,16 +1357,17 @@
     return p;
   }
 
-  async function masterStemsAsync(x, sr, onStatus) {
+  async function masterStemsAsync(x, sr, onStatus, onStem) {
     onStatus = onStatus || (() => {});
     const stems = await separateAsync(x, sr, onStatus);
     const out = {}, before = {}, after = {};
     for (const name of STEM_ORDER) {
       onStatus("Мастеринг дорожки: " + name);
       const s = stems[name];
-      const fIn = analyze(f32ToF64(s), sr);
+      stems[name] = null;
+      const fIn = analyze(s, sr);
       const preDb = clip(-22 - fIn.lufs, -20, 20);
-      const sw = reGain(f32ToF64(s), Math.pow(10, preDb / 20));
+      const sw = copyPreGain(s, Math.pow(10, preDb / 20));
       let p = buildStemParams(name, fIn);
       let y = applyChain(sw, sr, p);
       let ft = analyze(y, sr);
@@ -948,10 +1379,10 @@
       }
       out[name] = { raw: s, master: y, params: p };
       before[name] = fIn; after[name] = ft;
+      if (onStem) { await onStem(name, { raw: s, master: y, params: p, before: fIn, after: ft }); out[name].raw = null; out[name].master = null; }
     }
     return { stems: out, before, after };
   }
-
   // ------------------------------------------------------------------ WAV --
   function encodeWav(x, sr) {
     const n = x.n, dataLen = n * 2 * 2;
@@ -981,7 +1412,7 @@
     lufs, lufsGated, crestFactor, stereoWidth, bandEnergyDb, spectralCentroid,
     analyze, balanceVector, publicFeats,
     predict, sanitize, refineStep, applyChain, safeRender, loss,
-    processAsync, separateAsync, masterStemsAsync, buildStemParams, STEM_REFERENCE,
+    processAsync, separateAsync, masterStemsAsync, buildStemParams, STEM_REFERENCE, streamRender,
     fftInOut, ensureFFT, medianFilterAxis, softBandMaskF,
     encodeWav,
   };

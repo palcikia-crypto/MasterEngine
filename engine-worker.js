@@ -12,29 +12,23 @@ self.onmessage = async (e) => {
     const t0 = Date.now();
     const f32 = new Float32Array(d.buf);
     const n = d.n | 0;
-    const x = E.planar64(n);
+    const x = E.planar32(n);
     x.L.set(f32.subarray(0, n));
     x.R.set(f32.subarray(n, 2 * n));
-    say("Трек принят: " + n + " сэмплов, " + d.sr + " Hz");
+    say("Трек принят: " + n + " семплов, " + d.sr + " Hz");
     const main = await E.processAsync(x, d.sr, { params: d.params || null, iters: d.iters }, (msg, pct) => say(msg, pct == null ? null : pct));
     const files = {};
     const res = main.result;
     if (d.stems) {
-      const onStatus = (msg) => say(msg);
-      const ms = await E.masterStemsAsync(x, d.sr, onStatus);
-      const mix = E.planar64(n);
+      const mix = E.planar32(n);
       res.stems = {};
-      for (const name of Object.keys(ms.stems)) {
-        const st = ms.stems[name];
-        res.stems[name] = {
-          before: E.publicFeats(ms.before[name]),
-          after: E.publicFeats(ms.after[name]),
-          params: st.params,
-        };
+      const onStem = (name, st) => {
+        res.stems[name] = { before: E.publicFeats(st.before), after: E.publicFeats(st.after), params: st.params };
         files["/session/stem_" + name + ".wav"] = E.encodeWav(st.raw, d.sr).buffer;
         files["/session/stemm_" + name + ".wav"] = E.encodeWav(st.master, d.sr).buffer;
         for (let i = 0; i < n; i++) { mix.L[i] += st.master.L[i]; mix.R[i] += st.master.R[i]; }
-      }
+      };
+      await E.masterStemsAsync(x, d.sr, (msg) => say(msg), onStem);
       files["/session/stem_mix.wav"] = E.encodeWav(mix, d.sr).buffer;
     }
     files["/session/mastered.wav"] = E.encodeWav(main.y, d.sr).buffer;
