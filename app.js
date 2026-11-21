@@ -1,4 +1,7 @@
-/* MasterEngine web panel — UI driving the engine web worker. */
+/* MasterEngine web panel — UI driving the engine web worker (installable PWA). */
+if ("serviceWorker" in navigator && (location.protocol === "https:" || ["localhost", "127.0.0.1"].includes(location.hostname))) {
+  navigator.serviceWorker.register("sw.js").catch(() => {});
+}
 const $ = s => document.querySelector(s);
 
 let worker = null, ready = false;
