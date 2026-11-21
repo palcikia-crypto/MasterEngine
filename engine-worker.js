@@ -1,60 +1,50 @@
-/* MasterEngine worker: Pyodide runtime + heavy processing off the main thread. */
-importScripts("https://cdn.jsdelivr.net/pyodide/v0.26.4/full/pyodide.js");
+/* MasterEngine worker — pure JS engine, everything off the main thread. */
+importScripts("js-engine.js");
+const E = self.MasterEngine;
 
-let py = null;
 const post = (m, tr) => self.postMessage(m, tr || []);
-
-async function boot() {
-  try {
-    post({ t: "status", msg: "Гружу рантайм Pyodide (~25 МБ) — один раз на страницу…", pct: 10 });
-    py = await loadPyodide();
-    post({ t: "status", msg: "Гружу numpy + scipy (WASM)…", pct: 45 });
-    await py.loadPackage(["numpy", "scipy"]);
-    post({ t: "status", msg: "Гружу движок MasterEngine…", pct: 85 });
-    py.FS.mkdirTree("/engine/masterengine");
-    for (const f of ["__init__.py", "dsp.py", "analysis.py", "ml.py", "master.py", "stems.py"]) {
-      const r = await fetch("masterengine/" + f);
-      if (!r.ok) throw new Error("fetch " + f + ": " + r.status);
-      py.FS.writeFile("/engine/masterengine/" + f, new Uint8Array(await r.arrayBuffer()));
-    }
-    const glue = await (await fetch("engine_glue.py")).text();
-    await py.runPythonAsync(glue);
-    py.setStdout({ batched: (s) => {
-      const m = s.match(/^\[ME\]\s*(.+)$/);
-      if (m) post({ t: "status", msg: m[1], pct: null });
-      const r = s.match(/^\[RESULT\](.*)$/);
-      if (r) pendingResult = r[1];
-    } });
-    post({ t: "ready" });
-  } catch (e) {
-    post({ t: "error", msg: String(e.message || e) });
-  }
-}
-boot();
-
-let pendingResult = null;
+const say = (msg, pct) => post({ t: "status", msg, pct: pct == null ? null : pct });
 
 self.onmessage = async (e) => {
   const d = e.data;
+  if (d.t !== "load") return;
   try {
-    if (d.t === "load") {
-      if (!py) throw new Error("движок ещё не готов");
-      py.globals.set("me_in", new Uint8Array(d.buf));
-      await py.runPythonAsync(`set_audio(me_in.to_bytes(), ${d.n}, ${d.sr})`);
-      if (!py.globals.has("_X")) throw new Error("движок не принял аудио");
-      py.globals.set("me_cfg", JSON.stringify({ stems: !!d.stems, iters: d.iters || 6, params: d.params || null }));
-      pendingResult = null;
-      const out = await py.runPythonAsync("await run_master_async()");
-      let json = pendingResult || out;
-      if (json && json.startsWith("[RESULT]")) json = json.slice(8);
-      const res = JSON.parse(json);
-      const files = {};
-      for (const p of res.frames) {
-        files[p] = py.FS.readFile(p).slice().buffer;
+    const t0 = Date.now();
+    const f32 = new Float32Array(d.buf);
+    const n = d.n | 0;
+    const x = E.planar64(n);
+    x.L.set(f32.subarray(0, n));
+    x.R.set(f32.subarray(n, 2 * n));
+    say("Трек принят: " + n + " сэмплов, " + d.sr + " Hz");
+    const main = await E.processAsync(x, d.sr, { params: d.params || null, iters: d.iters }, (msg, pct) => say(msg, pct == null ? null : pct));
+    const files = {};
+    const res = main.result;
+    if (d.stems) {
+      const onStatus = (msg) => say(msg);
+      const ms = await E.masterStemsAsync(x, d.sr, onStatus);
+      const mix = E.planar64(n);
+      res.stems = {};
+      for (const name of Object.keys(ms.stems)) {
+        const st = ms.stems[name];
+        res.stems[name] = {
+          before: E.publicFeats(ms.before[name]),
+          after: E.publicFeats(ms.after[name]),
+          params: st.params,
+        };
+        files["/session/stem_" + name + ".wav"] = E.encodeWav(st.raw, d.sr).buffer;
+        files["/session/stemm_" + name + ".wav"] = E.encodeWav(st.master, d.sr).buffer;
+        for (let i = 0; i < n; i++) { mix.L[i] += st.master.L[i]; mix.R[i] += st.master.R[i]; }
       }
-      post({ t: "result", res, files }, Object.values(files));
+      files["/session/stem_mix.wav"] = E.encodeWav(mix, d.sr).buffer;
     }
+    files["/session/mastered.wav"] = E.encodeWav(main.y, d.sr).buffer;
+    files["/session/original.wav"] = E.encodeWav(x, d.sr).buffer;
+    res.frames = Object.keys(files);
+    say("Готово за " + ((Date.now() - t0) / 1000).toFixed(1) + " с.", null);
+    post({ t: "result", res, files }, Object.values(files));
   } catch (err) {
-    post({ t: "error", msg: String(err.message || err).split("\n").slice(-4).join(" | ") });
+    post({ t: "error", msg: String((err && err.stack) || err).split("\n").slice(-4).join(" | ") });
   }
 };
+
+post({ t: "ready" });

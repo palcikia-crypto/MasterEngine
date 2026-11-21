@@ -122,12 +122,10 @@ def compress(x, sr, thr_db=-18.0, ratio=3.0, attack_ms=10.0, release_ms=120.0,
     ctrl_sr = sr / block
     xdb = _db(env)
     over = xdb - thr_db
-    g_db = np.where(over > knee_db / 2,
-                    (1 - 1 / ratio) * (np.minimum(over, knee_db / 2) +
-                                       np.maximum(over - knee_db, 0.0) / ratio + knee_db / 2),
-                    0.0)
-    g_db = np.where((over > 0) & (over <= knee_db / 2),
-                    (1 - 1 / ratio) * (over ** 2) / (2 * knee_db), 0.0)
+    g_db = np.where(over > knee_db,
+                    (1 - 1 / ratio) * (over - knee_db / 2), 0.0)
+    g_db = np.where((over > 0) & (over <= knee_db),
+                    (1 - 1 / ratio) * (over ** 2) / (2 * knee_db), g_db)
     g_db = -_smooth(np.maximum(g_db, 0.0), attack_ms, release_ms, ctrl_sr)
     gain = _upsample_gain(10.0 ** (g_db / 20.0), x.shape[0], block)
     gain[m:] = gain[m - 1:m] if m > 0 else 1.0

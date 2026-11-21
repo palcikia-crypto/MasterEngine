@@ -138,7 +138,8 @@ function addSl(box, label, val, min, max, step, set) {
 $("#rerun").onclick = () => {
   if (!audioData) return;
   status("Пересчитываю с твоими настройками…", false, false, 10);
-  worker.postMessage({ t: "load", buf: audioData.copy.buffer, n: nSamples, sr, stems: false, iters: 5, params: lastRes ? lastRes.params : null });
+  const snd = audioData.copy.slice(0, 2 * nSamples);
+  worker.postMessage({ t: "load", buf: snd.buffer, n: nSamples, sr, stems: false, iters: 5, params: lastRes ? lastRes.params : null }, [snd.buffer]);
 };
 
 $("#ab").onclick = () => {
